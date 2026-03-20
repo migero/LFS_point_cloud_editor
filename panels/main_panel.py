@@ -21,8 +21,14 @@ class PointCloudEditorPanel(lf.ui.Panel):
 
     def __init__(self):
         """Initialize the panel with default parameters."""
+        # Removal parameters
         self._voxel_size = 0.01  # Default voxel size for neighbor search
         self._neighbor_threshold = 2  # Minimum number of neighbors to keep a point
+        
+        # Simplification parameters
+        self._simplify_voxel_size = 0.05  # Voxel size for simplification
+        self._points_per_cluster = 5  # Number of points to merge into one
+        
         self._processing = False
         self._last_result = None
         self._backup_data = None  # Store backup before modification
@@ -44,37 +50,79 @@ class PointCloudEditorPanel(lf.ui.Panel):
 
     def draw(self, ui):
         """Draw the immediate-mode UI."""
-        ui.heading("Point Cloud Removal")
-        ui.text_disabled("Remove points with few neighbors within a voxel distance")
+        ui.heading("Point Cloud Editor")
         
-        ui.separator()
-        
-        # Voxel size slider for neighbor search radius
-        changed, self._voxel_size = ui.slider_float(
-            "Voxel Size", 
-            self._voxel_size, 
-            0.001, 
-            0.5
-        )
+        # ============ ISOLATED POINT REMOVAL ============
+        if ui.collapsing_header("Isolated Point Removal", default_open=True):
+            ui.text_disabled("Remove points with few neighbors")
+            
+            ui.spacing()
+            
+            # Voxel size slider for neighbor search radius
+            changed, self._voxel_size = ui.slider_float(
+                "Search Radius", 
+                self._voxel_size, 
+                0.001, 
+                0.5
+            )
+            
+            # Neighbor threshold input
+            changed, self._neighbor_threshold = ui.slider_int(
+                "Min Neighbors",
+                self._neighbor_threshold,
+                1,
+                20
+            )
+            
+            ui.spacing()
+            
+            if ui.button("Remove Isolated Points", (-1, 0)):
+                self._remove_isolated_points()
         
         ui.spacing()
         
-        # Neighbor threshold input
-        changed, self._neighbor_threshold = ui.slider_int(
-            "Neighbor Threshold",
-            self._neighbor_threshold,
-            1,
-            20
-        )
+        # ============ POINT CLOUD SIMPLIFICATION ============
+        if ui.collapsing_header("Point Cloud Simplification", default_open=True):
+            ui.text_disabled("Merge nearby points by averaging")
+            
+            ui.spacing()
+            
+            # Simplification voxel size
+            changed, self._simplify_voxel_size = ui.slider_float(
+                "Merge Distance",
+                self._simplify_voxel_size,
+                0.001,
+                1.0
+            )
+            
+            # Points per cluster
+            changed, self._points_per_cluster = ui.slider_int(
+                "Points per Cluster",
+                self._points_per_cluster,
+                2,
+                50
+            )
+            
+            ui.spacing()
+            
+            if ui.button("Simplify Point Cloud", (-1, 0)):
+                self._simplify_point_cloud()
         
         ui.separator()
         
-        # Action buttons
-        if ui.button("Remove Isolated Points", (-1, 0)):
-            self._remove_isolated_points()
-        
+        # ============ SAVE & UNDO ============
         if ui.button("Save Point Cloud", (-1, 0)):
             self._save_point_cloud()
+        
+        ui.same_line()
+        
+        if lf.undo.can_undo():
+            if ui.button("Undo", (100, 0)):
+                lf.undo.undo()
+        else:
+            ui.begin_disabled(True)
+            ui.button("Undo", (100, 0))
+            ui.end_disabled()
         
         # Show result from last operation
         if self._last_result:
@@ -146,6 +194,10 @@ class PointCloudEditorPanel(lf.ui.Panel):
                 self._last_result = f"No isolated points found\n{original_count:,} points remain"
                 lf.log.info("No points removed")
             else:
+                # Backup current state for undo
+                original_means = means_np.copy()
+                original_colors = colors_np.copy() if target_pc.colors is not None else None
+                
                 # Apply filter to point cloud
                 # Convert numpy bool array to lichtfeld Tensor
                 # The filter() method handles device conversion internally
@@ -157,6 +209,29 @@ class PointCloudEditorPanel(lf.ui.Panel):
                 
                 # Notify the scene that data has changed
                 scene.notify_changed()
+                
+                # Push undo step
+                def undo_removal():
+                    """Restore the original point cloud."""
+                    means_restore = lf.Tensor.from_numpy(original_means).cuda()
+                    if original_colors is not None:
+                        colors_restore = lf.Tensor.from_numpy(original_colors).cuda()
+                    else:
+                        colors_restore = lf.Tensor.from_numpy(np.ones((len(original_means), 3), dtype=np.uint8) * 255).cuda()
+                    target_pc.set_data(means_restore, colors_restore)
+                    scene.notify_changed()
+                
+                def redo_removal():
+                    """Reapply the filter."""
+                    keep_tensor_redo = lf.Tensor.from_numpy(keep_mask)
+                    target_pc.filter(keep_tensor_redo)
+                    scene.notify_changed()
+                
+                lf.undo.push(
+                    f"Remove Isolated Points ({remove_count:,})",
+                    undo_removal,
+                    redo_removal
+                )
                 
                 self._last_result = (
                     f"Removed {remove_count:,} isolated points\n"
@@ -242,6 +317,214 @@ class PointCloudEditorPanel(lf.ui.Panel):
                 lf.log.info(f"Processed {i + batch_size:,} / {n:,} points")
         
         return keep_mask
+
+    def _simplify_point_cloud(self):
+        """Simplify point cloud by merging nearby points through averaging."""
+        self._processing = True
+        self._last_result = None
+        
+        try:
+            scene = lf.get_scene()
+            
+            # Find the first point cloud node
+            target_node = None
+            target_pc = None
+            for node in scene.get_nodes():
+                pc = node.point_cloud()
+                if pc is not None:
+                    target_node = node
+                    target_pc = pc
+                    break
+            
+            if target_pc is None:
+                self._last_result = "Error: No point cloud found in scene"
+                lf.log.error(self._last_result)
+                return
+            
+            original_count = target_pc.size
+            lf.log.info(f"Simplifying point cloud '{target_node.name}' with {original_count:,} points")
+            lf.log.info(f"Parameters: merge_distance={self._simplify_voxel_size}, points_per_cluster={self._points_per_cluster}")
+            
+            # Get point data
+            means_tensor = target_pc.means
+            colors_tensor = target_pc.colors
+            
+            if means_tensor is None:
+                self._last_result = "Error: Point cloud has no position data"
+                lf.log.error(self._last_result)
+                return
+            
+            # Convert to numpy
+            means_np = means_tensor.cpu().numpy()
+            colors_np = colors_tensor.cpu().numpy() if colors_tensor is not None else None
+            
+            # Backup original data for undo
+            original_means = means_np.copy()
+            original_colors = colors_np.copy() if colors_np is not None else None
+            
+            start_time = time.time()
+            
+            # Perform simplification
+            new_means, new_colors = self._cluster_and_average(
+                means_np, 
+                colors_np,
+                self._simplify_voxel_size,
+                self._points_per_cluster
+            )
+            
+            elapsed = time.time() - start_time
+            
+            new_count = len(new_means)
+            removed_count = original_count - new_count
+            reduction_pct = (removed_count / original_count) * 100 if original_count > 0 else 0
+            
+            lf.log.info(f"Simplified to {new_count:,} points ({removed_count:,} merged, {reduction_pct:.1f}% reduction)")
+            lf.log.info(f"Processing time: {elapsed:.2f}s")
+            
+            if removed_count == 0:
+                self._last_result = f"No simplification applied\n{original_count:,} points remain"
+                lf.log.info("No points merged")
+            else:
+                # Convert to tensors
+                means_new_tensor = lf.Tensor.from_numpy(new_means.astype(np.float32)).cuda()
+                
+                if new_colors is not None:
+                    if new_colors.dtype != np.uint8:
+                        new_colors = (new_colors * 255).astype(np.uint8)
+                    colors_new_tensor = lf.Tensor.from_numpy(new_colors).cuda()
+                else:
+                    colors_new_tensor = lf.Tensor.from_numpy(np.ones((new_count, 3), dtype=np.uint8) * 255).cuda()
+                
+                # Replace point cloud data
+                target_pc.set_data(means_new_tensor, colors_new_tensor)
+                
+                # Mark as modified
+                scene.is_point_cloud_modified = True
+                scene.notify_changed()
+                
+                # Push undo step
+                def undo_simplify():
+                    """Restore the original point cloud."""
+                    means_restore = lf.Tensor.from_numpy(original_means).cuda()
+                    if original_colors is not None:
+                        colors_restore = lf.Tensor.from_numpy(original_colors).cuda()
+                    else:
+                        colors_restore = lf.Tensor.from_numpy(np.ones((len(original_means), 3), dtype=np.uint8) * 255).cuda()
+                    target_pc.set_data(means_restore, colors_restore)
+                    scene.notify_changed()
+                
+                def redo_simplify():
+                    """Reapply the simplification."""
+                    means_redo = lf.Tensor.from_numpy(new_means.astype(np.float32)).cuda()
+                    colors_redo = lf.Tensor.from_numpy(new_colors if new_colors.dtype == np.uint8 else (new_colors * 255).astype(np.uint8)).cuda()
+                    target_pc.set_data(means_redo, colors_redo)
+                    scene.notify_changed()
+                
+                lf.undo.push(
+                    f"Simplify Point Cloud ({removed_count:,} merged)",
+                    undo_simplify,
+                    redo_simplify
+                )
+                
+                self._last_result = (
+                    f"Simplified point cloud\n"
+                    f"Original: {original_count:,} points\n"
+                    f"Result: {new_count:,} points\n"
+                    f"Reduction: {reduction_pct:.1f}%\n"
+                    f"Time: {elapsed:.2f}s"
+                )
+                lf.log.info(f"Successfully simplified point cloud")
+        
+        except Exception as e:
+            self._last_result = f"Error: {str(e)}"
+            lf.log.error(f"Error simplifying point cloud: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        finally:
+            self._processing = False
+
+    def _cluster_and_average(self, points: np.ndarray, colors: Optional[np.ndarray], 
+                            merge_distance: float, points_per_cluster: int) -> tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        Cluster nearby points and average their positions and colors.
+        
+        Uses a greedy clustering approach:
+        1. For each unprocessed point, find nearby neighbors
+        2. Average up to N neighbors together
+        3. Mark them as processed to avoid reuse
+        
+        Args:
+            points: Nx3 array of point positions
+            colors: Nx3 array of colors (or None)
+            merge_distance: Maximum distance for points to be merged
+            points_per_cluster: Target number of points to merge into one
+            
+        Returns:
+            (new_points, new_colors) - Simplified arrays
+        """
+        try:
+            from scipy.spatial import cKDTree
+        except ImportError:
+            lf.log.error("scipy required for simplification")
+            return points, colors
+        
+        n = len(points)
+        processed = np.zeros(n, dtype=bool)
+        
+        new_points_list = []
+        new_colors_list = [] if colors is not None else None
+        
+        lf.log.info(f"Building KD-tree for simplification...")
+        tree = cKDTree(points)
+        
+        lf.log.info(f"Clustering points (target: {points_per_cluster} per cluster)...")
+        
+        processed_count = 0
+        cluster_count = 0
+        
+        for i in range(n):
+            if processed[i]:
+                continue
+            
+            # Find neighbors within merge distance
+            neighbor_indices = tree.query_ball_point(points[i], merge_distance)
+            
+            # Filter out already processed points
+            available_neighbors = [idx for idx in neighbor_indices if not processed[idx]]
+            
+            if len(available_neighbors) == 0:
+                continue
+            
+            # Take up to points_per_cluster neighbors
+            cluster_indices = available_neighbors[:points_per_cluster]
+            
+            # Average positions
+            cluster_points = points[cluster_indices]
+            avg_point = cluster_points.mean(axis=0)
+            new_points_list.append(avg_point)
+            
+            # Average colors if available
+            if colors is not None:
+                cluster_colors = colors[cluster_indices]
+                avg_color = cluster_colors.mean(axis=0)
+                new_colors_list.append(avg_color)
+            
+            # Mark all points in cluster as processed
+            processed[cluster_indices] = True
+            processed_count += len(cluster_indices)
+            cluster_count += 1
+            
+            # Log progress every 10000 clusters
+            if cluster_count % 10000 == 0:
+                lf.log.info(f"  Processed {processed_count:,} / {n:,} points, {cluster_count:,} clusters created")
+        
+        new_points = np.array(new_points_list, dtype=np.float32)
+        new_colors = np.array(new_colors_list, dtype=colors.dtype) if new_colors_list else None
+        
+        lf.log.info(f"Created {cluster_count:,} clusters from {n:,} points")
+        
+        return new_points, new_colors
 
     def _save_point_cloud(self):
         """Save the current point cloud to a PLY file."""
