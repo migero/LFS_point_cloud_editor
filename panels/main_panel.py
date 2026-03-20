@@ -44,91 +44,44 @@ class PointCloudEditorPanel(lf.ui.Panel):
 
     def draw(self, ui):
         """Draw the immediate-mode UI."""
-        try:
-            ui.heading("Point Cloud Isolation Removal")
-            ui.text_disabled("Remove points with few neighbors within a voxel distance")
-            
-            ui.separator()
-            
-            # Voxel size slider for neighbor search radius
-            ui.text("Voxel Size (Search Radius)")
-            changed, self._voxel_size = ui.slider_float(
-                "##voxel_size", 
-                self._voxel_size, 
-                0.001, 
-                0.5,
-                format="%.4f"
-            )
-            ui.text_disabled("Distance to search for neighboring points")
-            
-            ui.spacing()
-            
-            # Neighbor threshold input
-            ui.text("Neighbor Threshold")
-            changed, self._neighbor_threshold = ui.slider_int(
-                "##neighbor_threshold",
-                self._neighbor_threshold,
-                1,
-                20
-            )
-            ui.text_disabled(f"Remove points with <= {self._neighbor_threshold} neighbors")
-            
-            ui.separator()
-            
-            # Show current scene info - with error handling
-            try:
-                scene = lf.get_scene()
-                if scene and scene.has_nodes():
-                    point_cloud_nodes = []
-                    for node in scene.get_nodes():
-                        try:
-                            pc = node.point_cloud()
-                            if pc is not None:
-                                point_cloud_nodes.append((node.name, pc.size))
-                        except Exception as e:
-                            lf.log.warn(f"Error accessing node point cloud: {e}")
-                            continue
-                    
-                    if point_cloud_nodes:
-                        ui.text(f"Point Cloud Nodes: {len(point_cloud_nodes)}")
-                        for name, count in point_cloud_nodes:
-                            ui.text_disabled(f"  • {name}: {count:,} points")
-                    else:
-                        ui.text("No point cloud nodes found")
-                else:
-                    ui.text("Scene not loaded")
-            except Exception as e:
-                ui.text(f"Error accessing scene: {str(e)}")
-                lf.log.error(f"Error in draw() getting scene info: {e}")
-            
-            ui.separator()
-            
-            # Action buttons
-            if self._processing:
-                ui.text("Processing...")
-            else:
-                if ui.button_styled("Remove Isolated Points", "primary", (250, 0)):
-                    self._remove_isolated_points()
-                
-                ui.spacing()
-                
-                # Save button
-                if ui.button_styled("Save Point Cloud", "secondary", (250, 0)):
-                    self._save_point_cloud()
-                
-                # Show result from last operation
-                if self._last_result:
-                    ui.spacing()
-                    ui.separator()
-                    ui.text("Last Operation:")
-                    for line in self._last_result.split('\n'):
-                        ui.text_disabled(line)
+        ui.heading("Point Cloud Removal")
+        ui.text_disabled("Remove points with few neighbors within a voxel distance")
         
-        except Exception as e:
-            ui.text(f"UI Error: {str(e)}")
-            lf.log.error(f"Error in draw(): {e}")
-            import traceback
-            traceback.print_exc()
+        ui.separator()
+        
+        # Voxel size slider for neighbor search radius
+        changed, self._voxel_size = ui.slider_float(
+            "Voxel Size", 
+            self._voxel_size, 
+            0.001, 
+            0.5
+        )
+        
+        ui.spacing()
+        
+        # Neighbor threshold input
+        changed, self._neighbor_threshold = ui.slider_int(
+            "Neighbor Threshold",
+            self._neighbor_threshold,
+            1,
+            20
+        )
+        
+        ui.separator()
+        
+        # Action buttons
+        if ui.button("Remove Isolated Points", (-1, 0)):
+            self._remove_isolated_points()
+        
+        if ui.button("Save Point Cloud", (-1, 0)):
+            self._save_point_cloud()
+        
+        # Show result from last operation
+        if self._last_result:
+            ui.separator()
+            ui.label("Last Operation:")
+            for line in self._last_result.split('\n'):
+                ui.text_disabled(line)
 
     def _remove_isolated_points(self):
         """Remove isolated points from the point cloud."""
@@ -195,7 +148,8 @@ class PointCloudEditorPanel(lf.ui.Panel):
             else:
                 # Apply filter to point cloud
                 # Convert numpy bool array to lichtfeld Tensor
-                keep_tensor = lf.Tensor.from_numpy(keep_mask).to(means_tensor.device)
+                # The filter() method handles device conversion internally
+                keep_tensor = lf.Tensor.from_numpy(keep_mask)
                 removed = target_pc.filter(keep_tensor)
                 
                 # Mark point cloud as modified so it can be saved
